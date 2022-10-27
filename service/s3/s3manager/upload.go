@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -564,6 +567,11 @@ type chunk struct {
 	buf     io.ReadSeeker
 	num     int64
 	cleanup func()
+
+	// MPU metrics
+	nextChunkLen  int64
+	partsUploaded *int64
+	bytesUploaded *int64
 }
 
 // completedParts is a wrapper to make parts sortable by their part number,
@@ -574,9 +582,42 @@ func (a completedParts) Len() int           { return len(a) }
 func (a completedParts) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a completedParts) Less(i, j int) bool { return *a[i].PartNumber < *a[j].PartNumber }
 
+func printMPUHeader() { fmt.Printf("Timestamp,Goroutines,Parts Uploaded,MB Uploaded,Part/s,MB/s\n") }
+func printMPUMetrics(start time.Time, partsUploaded int64, bytesUploaded int64) {
+	now := time.Now()
+	nowParsed := now.Format("060102150405") // yyMMddHHmmss
+	mbUploaded := float64(bytesUploaded) / float64(1024*1024)
+	timeSub := now.Sub(start)
+	secsElapsed := float64(timeSub) / float64(1000000000)
+	partsPerSec := float64(partsUploaded) / secsElapsed
+	mbPerSec := float64(mbUploaded) / secsElapsed
+	fmt.Printf("%s,%d,%d,%.2f,%.2f,%.2f\n", nowParsed, runtime.NumGoroutine(), partsUploaded, mbUploaded, partsPerSec, mbPerSec)
+}
+
 // upload will perform a multipart upload using the firstBuf buffer containing
 // the first chunk of data.
 func (u *multiuploader) upload(firstBuf io.ReadSeeker, cleanup func()) (*UploadOutput, error) {
+	// Create MPU metrics
+	start := time.Now()
+	var partsUploaded int64
+	var bytesUploaded int64
+
+	// Start the metrics ticker
+	printMPUHeader()
+	ticker := time.NewTicker(2 * time.Second) // 2 seconds
+	quit := make(chan bool)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				printMPUMetrics(start, partsUploaded, bytesUploaded)
+			case <-quit:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+
 	params := &s3.CreateMultipartUploadInput{}
 	awsutil.Copy(params, u.in)
 
@@ -597,7 +638,7 @@ func (u *multiuploader) upload(firstBuf io.ReadSeeker, cleanup func()) (*UploadO
 
 	// Send part 1 to the workers
 	var num int64 = 1
-	ch <- chunk{buf: firstBuf, num: num, cleanup: cleanup}
+	ch <- chunk{buf: firstBuf, num: num, cleanup: cleanup, nextChunkLen: u.cfg.PartSize, partsUploaded: &partsUploaded, bytesUploaded: &bytesUploaded}
 
 	// Read and queue the rest of the parts
 	for u.geterr() == nil && err == nil {
@@ -619,7 +660,7 @@ func (u *multiuploader) upload(firstBuf io.ReadSeeker, cleanup func()) (*UploadO
 
 		num++
 
-		ch <- chunk{buf: reader, num: num, cleanup: cleanup}
+		ch <- chunk{buf: reader, num: num, cleanup: cleanup, nextChunkLen: int64(nextChunkLen), partsUploaded: &partsUploaded, bytesUploaded: &bytesUploaded}
 	}
 
 	// Close the channel, wait for workers, and complete upload
@@ -646,6 +687,10 @@ func (u *multiuploader) upload(firstBuf io.ReadSeeker, cleanup func()) (*UploadO
 	getReq.Config.Credentials = credentials.AnonymousCredentials
 	getReq.SetContext(u.ctx)
 	uploadLocation, _, _ := getReq.PresignRequest(1)
+
+	// Stop the metrics ticker and print final metrics
+	quit <- true
+	printMPUMetrics(start, partsUploaded, bytesUploaded)
 
 	return &UploadOutput{
 		Location:  uploadLocation,
@@ -729,6 +774,10 @@ func (u *multiuploader) send(c chunk) error {
 	u.m.Lock()
 	u.parts = append(u.parts, completed)
 	u.m.Unlock()
+
+	// Update metrics
+	atomic.AddInt64(c.partsUploaded, 1)
+	atomic.AddInt64(c.bytesUploaded, int64(c.nextChunkLen))
 
 	return nil
 }
